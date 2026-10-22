@@ -52,6 +52,10 @@ No torch compute op is used on the production path.
 * A final per-row kernel selects the top-k candidates by value and writes the
   sorted ids and scores.  Only exact value ties may be capped at the candidate
   buffer capacity.
+
+The conditional overflow refinement, atomic gather, and selection kernels use
+fixed launch parameters.  They are exempt from autotuning until the tuner can
+supply representative overflow inputs and reset the gather counters.
 """
 
 import torch
