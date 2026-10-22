@@ -1132,3 +1132,14 @@ concat_mla_q:
   - META: {BLOCK: 1024}
     num_warps: 8
     num_stages: 1
+
+compute_topk_scores_scan:
+  - META: {BLOCK: 2048}
+    num_warps: 4
+    num_stages: 1
+  - META: {BLOCK: 4096}
+    num_warps: 8
+    num_stages: 1
+  - META: {BLOCK: 8192}
+    num_warps: 8
+    num_stages: 2
