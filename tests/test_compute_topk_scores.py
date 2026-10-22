@@ -207,6 +207,17 @@ def test_compute_topk_scores_custom_token_ids(num_logprobs, max_custom):
 
 
 @pytest.mark.compute_topk_scores
+def test_compute_topk_scores_rejects_bad_inputs():
+    logits, sampled = _make_inputs(2, 1024, torch.float32)
+    with pytest.raises(NotImplementedError):
+        flaggems_vllm.compute_topk_scores(logits, 5, sampled.to(torch.int16))
+    with pytest.raises(NotImplementedError):
+        flaggems_vllm.compute_topk_scores(
+            torch.empty((2, 0), device=device), 0, sampled
+        )
+
+
+@pytest.mark.compute_topk_scores
 def test_compute_topk_scores_empty_batch():
     logits = torch.empty((0, 1024), dtype=torch.float32, device=device)
     sampled = torch.empty((0,), dtype=torch.int64, device=device)

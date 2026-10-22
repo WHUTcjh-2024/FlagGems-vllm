@@ -455,8 +455,16 @@ def compute_topk_scores(
         raise NotImplementedError(f"unsupported logits dtype: {logits.dtype}")
     if sampled_token_ids.numel() != logits.shape[0]:
         raise ValueError("sampled_token_ids must have one entry per row")
+    if sampled_token_ids.dtype not in (torch.int32, torch.int64):
+        raise NotImplementedError(
+            f"unsupported sampled_token_ids dtype: {sampled_token_ids.dtype}"
+        )
+    if sampled_token_ids.device != logits.device:
+        raise ValueError("logits and sampled_token_ids must be on one device")
 
     batch_size, vocab_size = logits.shape
+    if vocab_size == 0:
+        raise NotImplementedError("compute_topk_scores requires vocab_size > 0")
     device = logits.device
     out_i64 = sampled_token_ids.dtype == torch.int64
 
