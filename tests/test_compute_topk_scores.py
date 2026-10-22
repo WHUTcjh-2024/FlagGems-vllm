@@ -19,6 +19,8 @@ low-precision logits, so token ids are compared as a value multiset; ranks and
 the sampled-token column are compared exactly.
 """
 
+import math
+
 import pytest
 import torch
 
@@ -178,6 +180,112 @@ def test_compute_topk_scores_ties(num_logprobs):
 
 
 @pytest.mark.compute_topk_scores
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_compute_topk_scores_masked_logits_keep_valid_ids(dtype):
+    vocab, topk = 1024, 16
+    logits = torch.full((2, vocab), float("-inf"), dtype=dtype, device=device)
+    logits[0, 7] = 3
+    logits[0, 19] = 1
+    logits[1, 23] = 2
+    sampled = torch.tensor([7, 5], dtype=torch.int64, device=device)
+
+    out = flaggems_vllm.compute_topk_scores(logits, topk, sampled)
+    ids = out.logprob_token_ids[:, 1:]
+    assert torch.all((ids >= 0) & (ids < vocab))
+    assert torch.all(
+        torch.sort(ids, dim=1).values[:, 1:] != torch.sort(ids, dim=1).values[:, :-1]
+    )
+    assert torch.equal(ids[:, 0], torch.tensor([7, 23], device=device))
+    assert torch.isneginf(out.logprobs[0, 3:]).all()
+    assert torch.isneginf(out.logprobs[1, 2:]).all()
+    assert torch.equal(
+        out.selected_token_ranks, torch.tensor([1, vocab], device=device)
+    )
+
+
+@pytest.mark.compute_topk_scores
+def test_compute_topk_scores_masked_logits_custom_token_path():
+    from vllm.sampling_params import SamplingParams
+    from vllm.v1.worker.gpu.sample.logprob import LogprobTokenIdsState
+
+    vocab, topk = 1024, 16
+    logits = torch.full((1, vocab), float("-inf"), device=device)
+    logits[0, 11] = 1
+    sampled = torch.tensor([11], dtype=torch.int64, device=device)
+    state = LogprobTokenIdsState(max_num_reqs=1, device=torch.device("cuda"))
+    state.add_request(0, SamplingParams(logprob_token_ids=[]))
+    state.apply_staged_writes()
+    out = flaggems_vllm.compute_topk_scores(
+        logits,
+        topk,
+        sampled,
+        logprob_token_ids_state=state,
+        expanded_idx_mapping=torch.tensor([0], dtype=torch.int32, device=device),
+        max_per_req_token_ids=topk,
+    )
+    ids = out.logprob_token_ids[0, 1:]
+    assert torch.all((ids >= 0) & (ids < vocab))
+    assert torch.unique(ids).numel() == topk
+    assert ids[0] == 11
+    assert torch.isneginf(out.logprobs[0, 2:]).all()
+
+
+@pytest.mark.compute_topk_scores
+@pytest.mark.parametrize("spread", ["upper16", "upper24"])
+def test_compute_topk_scores_refines_oversized_fp32_group(spread):
+    vocab, topk = 32768, 50
+    token = torch.arange(vocab, dtype=torch.float32, device=device)
+    if spread == "upper24":
+        token = torch.floor(token / 128)
+    logits = (1.0 + token / (2**23)).reshape(1, vocab)
+    sampled = torch.tensor([0], dtype=torch.int64, device=device)
+
+    ref = _vllm_fn(logits, topk, sampled)
+    out = flaggems_vllm.compute_topk_scores(logits, topk, sampled)
+    _assert_matches(ref, out, logits, sampled, topk, strict_ids=spread == "upper16")
+
+
+@pytest.mark.compute_topk_scores
+def test_compute_topk_scores_refines_oversized_fp16_group():
+    vocab, topk = 32768, 50
+    token = torch.arange(vocab, dtype=torch.float32, device=device)
+    logits = (1.0 + torch.floor(token / 4096) / 1024).to(torch.float16).reshape(1, -1)
+    sampled = torch.tensor([0], dtype=torch.int64, device=device)
+    ref = _vllm_fn(logits, topk, sampled)
+    out = flaggems_vllm.compute_topk_scores(logits, topk, sampled)
+    _assert_matches(ref, out, logits, sampled, topk, strict_ids=False)
+
+
+@pytest.mark.compute_topk_scores
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("topk", [0, 5])
+def test_compute_topk_scores_large_common_offset(dtype, topk):
+    vocab = 1024
+    logits = torch.full((1, vocab), 1e9, dtype=dtype, device=device)
+    sampled = torch.tensor([0], dtype=torch.int64, device=device)
+    out = flaggems_vllm.compute_topk_scores(logits, topk, sampled)
+    torch.testing.assert_close(
+        out.logprobs, torch.full_like(out.logprobs, -math.log(vocab)), atol=1e-4, rtol=0
+    )
+
+
+@pytest.mark.compute_topk_scores
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="need two CUDA devices")
+def test_compute_topk_scores_uses_logits_device():
+    logits = torch.arange(2048, dtype=torch.float32, device="cuda:1").reshape(2, 1024)
+    sampled = torch.tensor([100, 900], dtype=torch.int64, device="cuda:1")
+    with torch.cuda.device(0):
+        out = flaggems_vllm.compute_topk_scores(logits, 5, sampled)
+        assert torch.cuda.current_device() == 0
+    assert out.logprob_token_ids.device == logits.device
+    assert out.logprobs.device == logits.device
+    assert torch.equal(
+        out.logprob_token_ids[:, 1:],
+        torch.tensor([[1023, 1022, 1021, 1020, 1019]] * 2, device="cuda:1"),
+    )
+
+
+@pytest.mark.compute_topk_scores
 @pytest.mark.parametrize("num_logprobs,max_custom", [(5, 3), (4, 4), (0, 1)])
 def test_compute_topk_scores_custom_token_ids(num_logprobs, max_custom):
     from vllm.sampling_params import SamplingParams
@@ -217,6 +325,9 @@ def test_compute_topk_scores_rejects_bad_inputs():
         )
     with pytest.raises(NotImplementedError):
         flaggems_vllm.compute_topk_scores(logits, 257, sampled)
+    sampled_view = torch.tensor([0, 99, 1, 99], dtype=torch.int64, device=device)[::2]
+    with pytest.raises(NotImplementedError, match="contiguous"):
+        flaggems_vllm.compute_topk_scores(logits, 5, sampled_view)
 
 
 @pytest.mark.compute_topk_scores

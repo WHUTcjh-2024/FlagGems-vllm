@@ -22,7 +22,7 @@ in vLLM 0.29.0):
 * ``logits``: 2D ``[batch, vocab]`` float16 / bfloat16 / float32 tensor with a
   contiguous innermost dimension.
 * ``num_logprobs``: ``0 <= k <= 256``.
-* ``sampled_token_ids``: 1D int32/int64 tensor, one id per row.
+* ``sampled_token_ids``: contiguous 1D int32/int64 tensor, one id per row.
 * optional ``cu_num_logits`` (list or tensor), ``logprob_token_ids_state`` +
   ``expanded_idx_mapping`` for per-request custom token ids, and
   ``logits_mode`` for raw-logit scores.
@@ -33,8 +33,9 @@ values (raw logits when ``logits_mode``), and ``selected_token_ranks`` counts
 the logits ``>=`` the sampled logit.
 
 Forward inference only.  ``k > 256``, non-float logits, a non-contiguous
-innermost stride, an empty vocabulary or a non-int32/int64 sampled-id dtype are
-rejected with ``NotImplementedError``/``ValueError``.
+innermost stride, an empty vocabulary, a non-int32/int64 sampled-id dtype or a
+non-contiguous sampled-id view are rejected with ``NotImplementedError``/
+``ValueError``.
 
 Design
 ------
@@ -45,12 +46,12 @@ No torch compute op is used on the production path.
   histogram of the top 8 bits of an order-preserving fp32 key.
 * A per-row kernel combines the splits, resolves the threshold bin and emits
   the log-softmax scores.  When a split is small enough its whole threshold
-  bin is gathered as candidates; otherwise one refinement level (the next
-  8 key bits) narrows the group first.
+  bin is gathered as candidates; otherwise the next 8 key bits narrow the
+  group first.  Oversized fp16/fp32 groups are refined through the remaining
+  key bits before gathering.
 * A final per-row kernel selects the top-k candidates by value and writes the
-  sorted ids and scores.  fp16/bf16 keys have 16 significant bits, so the
-  two histogram levels make the candidate group exactly value-tied; fp32
-  candidates are compared by value in the final selection.
+  sorted ids and scores.  Only exact value ties may be capped at the candidate
+  buffer capacity.
 """
 
 import torch
@@ -58,6 +59,7 @@ import triton
 import triton.language as tl
 
 from flaggems_vllm import runtime
+from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.utils import libentry, libtuner
 
 _BINS = 256
@@ -233,10 +235,8 @@ def _combine_level1_kernel(
             running_max = new_max
 
     if COMPUTE_LSE:
-        lse = running_max + tl.log(running_sum)
-    else:
-        lse = 0.0
-    tl.store(lse_ptr + row, lse)
+        tl.store(lse_ptr + row * 2, running_max)
+        tl.store(lse_ptr + row * 2 + 1, tl.log(running_sum))
     tl.store(rank_ptr + row, rank.to(tl.int64))
 
     if topk > 0:
@@ -307,12 +307,88 @@ def _combine_level2_kernel(
 
 
 @triton.jit
+def _refine_remaining_kernel(
+    logits_ptr,
+    logits_stride,
+    threshold1_ptr,
+    threshold2_ptr,
+    need2_ptr,
+    group2_ptr,
+    threshold3_ptr,
+    threshold4_ptr,
+    above3_ptr,
+    above4_ptr,
+    group3_ptr,
+    group4_ptr,
+    refinement_ptr,
+    vocab_size,
+    capacity,
+    BLOCK: tl.constexpr,
+    BINS: tl.constexpr,
+):
+    """Refine fp16/fp32 rows whose upper 16-bit threshold group overflows."""
+    row = tl.program_id(0)
+    tl.store(refinement_ptr + row, 0)
+    if tl.load(group2_ptr + row) <= capacity:
+        return
+
+    row_ptr = logits_ptr + row.to(tl.int64) * logits_stride
+    prefix = (tl.load(threshold1_ptr + row) << 8) | tl.load(threshold2_ptr + row)
+    hist = tl.zeros([BINS], dtype=tl.int32)
+    excluded = 0
+    for off in tl.range(0, vocab_size, BLOCK):
+        idx = off + tl.arange(0, BLOCK)
+        mask = idx < vocab_size
+        key = _sortable_key(tl.load(row_ptr + idx, mask=mask, other=0.0))
+        in_group = mask & ((key >> 16).to(tl.int32) == prefix)
+        hist += tl.histogram(
+            tl.where(in_group, ((key >> 8) & 0xFF).to(tl.int32), 0), BINS
+        )
+        excluded += tl.sum((~in_group).to(tl.int32))
+    bins = tl.arange(0, BINS)
+    hist -= tl.where(bins == 0, excluded, 0)
+    need = tl.load(need2_ptr + row)
+    cum = tl.cumsum(hist, axis=0, reverse=True)
+    threshold3 = tl.argmax(((cum >= need) & ((cum - hist) < need)).to(tl.int32))
+    above3 = tl.sum(tl.where(bins > threshold3, hist, 0))
+    group3 = tl.sum(tl.where(bins == threshold3, hist, 0))
+    tl.store(threshold3_ptr + row, threshold3)
+    tl.store(above3_ptr + row, above3)
+    tl.store(group3_ptr + row, group3)
+    tl.store(refinement_ptr + row, 1)
+    if group3 <= capacity:
+        return
+
+    prefix = (prefix << 8) | threshold3
+    hist = tl.zeros([BINS], dtype=tl.int32)
+    excluded = 0
+    for off in tl.range(0, vocab_size, BLOCK):
+        idx = off + tl.arange(0, BLOCK)
+        mask = idx < vocab_size
+        key = _sortable_key(tl.load(row_ptr + idx, mask=mask, other=0.0))
+        in_group = mask & ((key >> 8).to(tl.int32) == prefix)
+        hist += tl.histogram(tl.where(in_group, (key & 0xFF).to(tl.int32), 0), BINS)
+        excluded += tl.sum((~in_group).to(tl.int32))
+    hist -= tl.where(bins == 0, excluded, 0)
+    need = need - above3
+    cum = tl.cumsum(hist, axis=0, reverse=True)
+    threshold4 = tl.argmax(((cum >= need) & ((cum - hist) < need)).to(tl.int32))
+    tl.store(threshold4_ptr + row, threshold4)
+    tl.store(above4_ptr + row, tl.sum(tl.where(bins > threshold4, hist, 0)))
+    tl.store(group4_ptr + row, tl.sum(tl.where(bins == threshold4, hist, 0)))
+    tl.store(refinement_ptr + row, 2)
+
+
+@triton.jit
 def _gather_kernel(
     logits_ptr,
     logits_stride,
     threshold1_ptr,
     threshold2_ptr,
+    threshold3_ptr,
+    threshold4_ptr,
     refine1_ptr,
+    refinement_ptr,
     selected_count_ptr,
     group_count_ptr,
     candidate_ptr,
@@ -320,6 +396,7 @@ def _gather_kernel(
     chunk,
     topk,
     capacity,
+    REFINE_REMAINING: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     row = tl.program_id(0)
@@ -332,6 +409,13 @@ def _gather_kernel(
     thr1 = tl.load(threshold1_ptr + row)
     thr2 = tl.load(threshold2_ptr + row)
     refine1 = tl.load(refine1_ptr + row)
+    refinement = 0
+    if REFINE_REMAINING:
+        refinement = tl.load(refinement_ptr + row)
+    if refinement > 0:
+        thr3 = tl.load(threshold3_ptr + row)
+    if refinement > 1:
+        thr4 = tl.load(threshold4_ptr + row)
 
     for off in tl.range(start, end, BLOCK):
         idx = off + tl.arange(0, BLOCK)
@@ -349,6 +433,14 @@ def _gather_kernel(
             level2 = ((key >> 16) & 0xFF).to(tl.int32)
             selected = mask & ((level1 > thr1) | (in_bin1 & (level2 > thr2)))
             group = in_bin1 & (level2 == thr2)
+            if refinement > 0:
+                level3 = ((key >> 8) & 0xFF).to(tl.int32)
+                selected = selected | (group & (level3 > thr3))
+                group = group & (level3 == thr3)
+                if refinement > 1:
+                    level4 = (key & 0xFF).to(tl.int32)
+                    selected = selected | (group & (level4 > thr4))
+                    group = group & (level4 == thr4)
 
         selected_i = selected.to(tl.int32)
         base = tl.atomic_add(selected_count_ptr + row, tl.sum(selected_i))
@@ -376,9 +468,15 @@ def _select_partial_kernel(
     group1_ptr,
     group2_ptr,
     refine1_ptr,
+    above3_ptr,
+    above4_ptr,
+    group3_ptr,
+    group4_ptr,
+    refinement_ptr,
     partial_ptr,
     topk,
     capacity,
+    REFINE_REMAINING: tl.constexpr,
     TOPK: tl.constexpr,
     NUM_CAND: tl.constexpr,
     CHUNK: tl.constexpr,
@@ -391,6 +489,15 @@ def _select_partial_kernel(
         group = tl.minimum(tl.load(group2_ptr + row), capacity)
     else:
         group = tl.minimum(tl.load(group1_ptr + row), capacity)
+    refinement = 0
+    if REFINE_REMAINING:
+        refinement = tl.load(refinement_ptr + row)
+    if refinement > 0:
+        above += tl.load(above3_ptr + row)
+        group = tl.minimum(tl.load(group3_ptr + row), capacity)
+        if refinement > 1:
+            above += tl.load(above4_ptr + row)
+            group = tl.minimum(tl.load(group4_ptr + row), capacity)
 
     lane = part * CHUNK + tl.arange(0, CHUNK)
     valid = (lane < above) | ((lane >= TOPK) & (lane < TOPK + group))
@@ -406,12 +513,13 @@ def _select_partial_kernel(
     out_row = partial_ptr + (row * tl.num_programs(1) + part) * TOPK
     idx = tl.arange(0, CHUNK)
     for j in tl.static_range(TOPK):
-        best = tl.argmax(vals, axis=0)
         best_val = tl.max(vals, axis=0)
+        best = tl.min(tl.where(valid & (vals == best_val), idx, CHUNK), axis=0)
         best_id = tl.sum(tl.where(idx == best, ids, 0))
-        best_id = tl.where(best_val == float("-inf"), -1, best_id)
+        best_id = tl.where(best < CHUNK, best_id, -1)
         tl.store(out_row + j, best_id)
-        vals = tl.where(idx == best, float("-inf"), vals)
+        valid = valid & (idx != best)
+        vals = tl.where(valid, vals, float("-inf"))
 
 
 @triton.jit
@@ -447,22 +555,25 @@ def _merge_kernel(
 
     out_row = topk_ids_ptr + row * TOPK
     for j in tl.static_range(TOPK):
-        best = tl.argmax(vals, axis=0)
-        best_id = tl.sum(tl.where(idx == best, ids, 0))
         best_val = tl.max(vals, axis=0)
+        best = tl.min(tl.where(valid & (vals == best_val), idx, NUM_CAND), axis=0)
+        best_id = tl.sum(tl.where(idx == best, ids, 0))
         tl.store(out_row + j, best_id)
         if WRITE_SCORES:
             if LOGITS_MODE:
                 score = best_val
             else:
-                score = best_val - tl.load(lse_ptr + row)
+                score = (best_val - tl.load(lse_ptr + row * 2)) - tl.load(
+                    lse_ptr + row * 2 + 1
+                )
             out_idx = row * (TOPK + 1) + j + 1
             if OUT_I64:
                 tl.store(out_ids_ptr + out_idx, best_id)
             else:
                 tl.store(out_ids_ptr + out_idx, best_id.to(tl.int32))
             tl.store(out_scores_ptr + out_idx, score)
-        vals = tl.where(idx == best, float("-inf"), vals)
+        valid = valid & (idx != best)
+        vals = tl.where(valid, vals, float("-inf"))
 
     if WRITE_SCORES:
         sampled = tl.load(sampled_ptr + row).to(tl.int64)
@@ -472,7 +583,7 @@ def _merge_kernel(
         if LOGITS_MODE:
             score = x
         else:
-            score = x - tl.load(lse_ptr + row)
+            score = (x - tl.load(lse_ptr + row * 2)) - tl.load(lse_ptr + row * 2 + 1)
         out_idx = row * (TOPK + 1)
         if OUT_I64:
             tl.store(out_ids_ptr + out_idx, sampled)
@@ -523,7 +634,7 @@ def _sample_row_kernel(
     if LOGITS_MODE:
         score = sampled_val
     else:
-        score = sampled_val - (running_max + tl.log(running_sum))
+        score = (sampled_val - running_max) - tl.log(running_sum)
     tl.store(rank_ptr + row, rank.to(tl.int64))
     if OUT_I64:
         tl.store(out_ids_ptr + row, token)
@@ -549,7 +660,7 @@ def _sample_only_kernel(
     if LOGITS_MODE:
         score = x
     else:
-        score = x - tl.load(lse_ptr + row)
+        score = (x - tl.load(lse_ptr + row * 2)) - tl.load(lse_ptr + row * 2 + 1)
     if OUT_I64:
         tl.store(out_ids_ptr + row, sampled)
     else:
@@ -640,7 +751,7 @@ def _custom_scores_kernel(
     if LOGITS_MODE:
         score = x
     else:
-        score = x - tl.load(lse_ptr + row)
+        score = (x - tl.load(lse_ptr + row * 2)) - tl.load(lse_ptr + row * 2 + 1)
     score = tl.where(valid, score, float("-inf"))
     tl.store(scores_ptr + row * num_cols + cols, score, mask=mask)
 
@@ -681,7 +792,8 @@ def _select_topk(
     partial_sum = torch.empty((batch_size, splits), dtype=torch.float32, device=device)
     partial_rank = torch.empty((batch_size, splits), dtype=torch.int32, device=device)
 
-    lse = torch.empty((batch_size,), dtype=torch.float32, device=device)
+    # Keep the max separate from log(sum) to preserve shift invariance.
+    lse = torch.empty((batch_size, 2), dtype=torch.float32, device=device)
     ranks = torch.empty((batch_size,), dtype=torch.int64, device=device)
     threshold1 = torch.empty((batch_size,), dtype=torch.int32, device=device)
     need1 = torch.empty((batch_size,), dtype=torch.int32, device=device)
@@ -761,6 +873,42 @@ def _select_topk(
             BINS=_BINS,
         )
 
+        threshold3 = threshold2
+        threshold4 = threshold2
+        above3 = above2
+        above4 = above2
+        group3 = group2
+        group4 = group2
+        refinement = refine1
+        if logits.dtype != torch.bfloat16:
+            threshold3 = torch.empty((batch_size,), dtype=torch.int32, device=device)
+            threshold4 = torch.empty((batch_size,), dtype=torch.int32, device=device)
+            above3 = torch.empty((batch_size,), dtype=torch.int32, device=device)
+            above4 = torch.empty((batch_size,), dtype=torch.int32, device=device)
+            group3 = torch.empty((batch_size,), dtype=torch.int32, device=device)
+            group4 = torch.empty((batch_size,), dtype=torch.int32, device=device)
+            refinement = torch.empty((batch_size,), dtype=torch.int32, device=device)
+            _refine_remaining_kernel[(batch_size,)](
+                logits,
+                logits.stride(0),
+                threshold1,
+                threshold2,
+                need2,
+                group2,
+                threshold3,
+                threshold4,
+                above3,
+                above4,
+                group3,
+                group4,
+                refinement,
+                vocab_size,
+                capacity,
+                BLOCK=_GATHER_BLOCK,
+                BINS=_BINS,
+                num_warps=8,
+            )
+
         candidate = torch.empty(
             (batch_size, topk + capacity), dtype=torch.int32, device=device
         )
@@ -769,7 +917,10 @@ def _select_topk(
             logits.stride(0),
             threshold1,
             threshold2,
+            threshold3,
+            threshold4,
             refine1,
+            refinement,
             selected_count,
             group_count,
             candidate,
@@ -777,6 +928,7 @@ def _select_topk(
             chunk,
             topk,
             capacity,
+            REFINE_REMAINING=logits.dtype != torch.bfloat16,
             BLOCK=_GATHER_BLOCK,
             num_warps=8,
         )
@@ -797,9 +949,15 @@ def _select_topk(
             group1,
             group2,
             refine1,
+            above3,
+            above4,
+            group3,
+            group4,
+            refinement,
             partial,
             topk,
             capacity,
+            REFINE_REMAINING=logits.dtype != torch.bfloat16,
             TOPK=topk,
             NUM_CAND=num_cand,
             CHUNK=chunk,
@@ -847,6 +1005,8 @@ def compute_topk_scores(
         raise NotImplementedError(f"unsupported logits dtype: {logits.dtype}")
     if sampled_token_ids.numel() != logits.shape[0]:
         raise ValueError("sampled_token_ids must have one entry per row")
+    if sampled_token_ids.dim() != 1 or sampled_token_ids.stride(0) != 1:
+        raise NotImplementedError("sampled_token_ids must be contiguous and 1D")
     if sampled_token_ids.dtype not in (torch.int32, torch.int64):
         raise NotImplementedError(
             f"unsupported sampled_token_ids dtype: {sampled_token_ids.dtype}"
@@ -883,93 +1043,106 @@ def compute_topk_scores(
     if num_logprobs > vocab_size:
         raise ValueError("num_logprobs cannot exceed vocab_size")
 
-    if max_per_req_token_ids == 0:
-        width = num_logprobs + 1
-        out_ids = torch.empty(
-            (batch_size, width), dtype=sampled_token_ids.dtype, device=device
-        )
-        scores = torch.empty((batch_size, width), dtype=torch.float32, device=device)
-        if num_logprobs == 0 and _choose_splits(batch_size, vocab_size, 0) == 1:
-            ranks = torch.empty((batch_size,), dtype=torch.int64, device=device)
-            _sample_row_kernel[(batch_size,)](
-                logits,
-                logits.stride(0),
-                sampled_token_ids,
-                ranks,
-                out_ids,
-                scores,
-                vocab_size,
-                LOGITS_MODE=logits_mode,
-                OUT_I64=out_i64,
-                BLOCK=8192,
-                num_warps=8,
+    with torch_device_fn.device(device):
+        if max_per_req_token_ids == 0:
+            width = num_logprobs + 1
+            out_ids = torch.empty(
+                (batch_size, width), dtype=sampled_token_ids.dtype, device=device
             )
+            scores = torch.empty(
+                (batch_size, width), dtype=torch.float32, device=device
+            )
+            if num_logprobs == 0 and _choose_splits(batch_size, vocab_size, 0) == 1:
+                ranks = torch.empty((batch_size,), dtype=torch.int64, device=device)
+                _sample_row_kernel[(batch_size,)](
+                    logits,
+                    logits.stride(0),
+                    sampled_token_ids,
+                    ranks,
+                    out_ids,
+                    scores,
+                    vocab_size,
+                    LOGITS_MODE=logits_mode,
+                    OUT_I64=out_i64,
+                    BLOCK=8192,
+                    num_warps=8,
+                )
+            else:
+                lse, ranks, _ = _select_topk(
+                    logits,
+                    sampled_token_ids,
+                    num_logprobs,
+                    out_ids,
+                    scores,
+                    True,
+                    logits_mode,
+                )
+                if num_logprobs == 0:
+                    _sample_only_kernel[(batch_size,)](
+                        logits,
+                        logits.stride(0),
+                        sampled_token_ids,
+                        lse,
+                        out_ids,
+                        scores,
+                        LOGITS_MODE=logits_mode,
+                        OUT_I64=out_i64,
+                    )
         else:
-            lse, ranks, _ = _select_topk(
+            if logprob_token_ids_state is None or expanded_idx_mapping is None:
+                raise ValueError(
+                    "logprob_token_ids_state and expanded_idx_mapping are required "
+                    "when max_per_req_token_ids > 0"
+                )
+            num_cols = max(num_logprobs, max_per_req_token_ids)
+            width = num_cols + 1
+            state_ids = logprob_token_ids_state.token_ids.gpu
+            out_ids = torch.empty(
+                (batch_size, width), dtype=sampled_token_ids.dtype, device=device
+            )
+            valid_mask = torch.empty(
+                (batch_size, width), dtype=torch.bool, device=device
+            )
+            scores = torch.empty(
+                (batch_size, width), dtype=torch.float32, device=device
+            )
+            lse, ranks, topk_ids = _select_topk(
                 logits,
                 sampled_token_ids,
                 num_logprobs,
                 out_ids,
                 scores,
-                True,
+                False,
                 logits_mode,
             )
-            if num_logprobs == 0:
-                _sample_only_kernel[(batch_size,)](
-                    logits,
-                    logits.stride(0),
-                    sampled_token_ids,
-                    lse,
-                    out_ids,
-                    scores,
-                    LOGITS_MODE=logits_mode,
-                    OUT_I64=out_i64,
-                )
-    else:
-        if logprob_token_ids_state is None or expanded_idx_mapping is None:
-            raise ValueError(
-                "logprob_token_ids_state and expanded_idx_mapping are required "
-                "when max_per_req_token_ids > 0"
+            _fill_custom_ids_kernel[(batch_size,)](
+                out_ids,
+                out_ids.stride(0),
+                valid_mask,
+                valid_mask.stride(0),
+                sampled_token_ids,
+                topk_ids if topk_ids is not None else state_ids,
+                topk_ids.stride(0) if topk_ids is not None else state_ids.stride(0),
+                expanded_idx_mapping,
+                logprob_token_ids_state.num_token_ids.gpu,
+                state_ids,
+                state_ids.stride(0),
+                NUM_TOPK=num_logprobs,
+                PADDED_COLS=triton.next_power_of_2(width),
+                OUT_WIDTH=width,
+                OUT_I64=out_i64,
             )
-        num_cols = max(num_logprobs, max_per_req_token_ids)
-        width = num_cols + 1
-        state_ids = logprob_token_ids_state.token_ids.gpu
-        out_ids = torch.empty(
-            (batch_size, width), dtype=sampled_token_ids.dtype, device=device
-        )
-        valid_mask = torch.empty((batch_size, width), dtype=torch.bool, device=device)
-        scores = torch.empty((batch_size, width), dtype=torch.float32, device=device)
-        lse, ranks, topk_ids = _select_topk(
-            logits, sampled_token_ids, num_logprobs, out_ids, scores, False, logits_mode
-        )
-        _fill_custom_ids_kernel[(batch_size,)](
-            out_ids,
-            out_ids.stride(0),
-            valid_mask,
-            valid_mask.stride(0),
-            sampled_token_ids,
-            topk_ids if topk_ids is not None else state_ids,
-            topk_ids.stride(0) if topk_ids is not None else state_ids.stride(0),
-            expanded_idx_mapping,
-            logprob_token_ids_state.num_token_ids.gpu,
-            state_ids,
-            state_ids.stride(0),
-            NUM_TOPK=num_logprobs,
-            PADDED_COLS=triton.next_power_of_2(width),
-            OUT_WIDTH=width,
-            OUT_I64=out_i64,
-        )
-        _custom_scores_kernel[(batch_size, triton.cdiv(width, 128))](
-            logits,
-            logits.stride(0),
-            out_ids,
-            valid_mask,
-            lse,
-            scores,
-            width,
-            LOGITS_MODE=logits_mode,
-            BLOCK=128,
-        )
+            _custom_scores_kernel[(batch_size, triton.cdiv(width, 128))](
+                logits,
+                logits.stride(0),
+                out_ids,
+                valid_mask,
+                lse,
+                scores,
+                width,
+                LOGITS_MODE=logits_mode,
+                BLOCK=128,
+            )
 
     is_tensor = isinstance(cu_num_logits, torch.Tensor)
     return LogprobsTensors(
