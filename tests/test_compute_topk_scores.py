@@ -215,6 +215,8 @@ def test_compute_topk_scores_rejects_bad_inputs():
         flaggems_vllm.compute_topk_scores(
             torch.empty((2, 0), device=device), 0, sampled
         )
+    with pytest.raises(NotImplementedError):
+        flaggems_vllm.compute_topk_scores(logits, 257, sampled)
 
 
 @pytest.mark.compute_topk_scores
