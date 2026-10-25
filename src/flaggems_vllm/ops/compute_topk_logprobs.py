@@ -53,6 +53,7 @@ _BLOCK_TOPK_TILE = 2048
 # Candidate tiles are rounded up to a power of two for the merge kernel, which
 # holds every candidate of a row in one program; keep that tile bounded.
 _MIN_MERGE_BLOCK = 128
+_MAX_MERGE_CANDIDATES = 8192
 _MAX_NUM_LOGPROBS = 256
 
 
@@ -110,7 +111,10 @@ def _block_topk_kernel(
     num_blocks = tl.cdiv(vocab_size, BLOCK)
     out = (row * num_blocks + blk) * topk
 
-    for j in tl.range(0, topk):
+    # A tile can only yield BLOCK distinct candidates; the remaining slots are
+    # filled with sentinels so the merge stage never sees uninitialized data.
+    n_iter = tl.minimum(topk, BLOCK)
+    for j in tl.range(0, n_iter):
         best = tl.max(vals)
         # Lowest index among the lanes holding `best`; dead lanes carry the
         # sentinel index so an exhausted block emits nothing selectable.
@@ -120,6 +124,9 @@ def _block_topk_kernel(
         tl.store(cand_idx_ptr + out + j, idx)
         alive = alive & (offs != idx)
         vals = tl.where(alive, vals, float("-inf"))
+    for j in tl.range(n_iter, topk):
+        tl.store(cand_val_ptr + out + j, float("-inf"))
+        tl.store(cand_idx_ptr + out + j, vocab_size)
 
 
 @libentry()
@@ -256,12 +263,15 @@ def _ranks_kernel(
 
     if full < vocab_size:
         block = full + tl.arange(0, BLOCK_SIZE)
+        in_range = block < vocab_size
         logits = tl.load(
             row_ptr + block * logits_stride1,
-            mask=block < vocab_size,
+            mask=in_range,
             other=float("-inf"),
         )
-        n += tl.sum((logits >= x).to(tl.int32))
+        # The mask must be folded into the comparison: masked lanes are -inf,
+        # and -inf >= -inf would count padding as a tie for an all-masked row.
+        n += tl.sum(((logits >= x) & in_range).to(tl.int32))
 
     tl.store(output_ptr + req_idx, n.to(tl.int64))
 
@@ -297,6 +307,13 @@ def _validate(logits, num_logprobs, sampled_token_ids):
         raise NotImplementedError(
             f"num_logprobs above {_MAX_NUM_LOGPROBS} is not supported: the merge "
             "kernel holds every candidate of a row in one program"
+        )
+    num_blocks = triton.cdiv(logits.shape[1], _BLOCK_TOPK_TILE)
+    if num_blocks * num_logprobs > _MAX_MERGE_CANDIDATES:
+        raise NotImplementedError(
+            f"{num_blocks} vocab blocks x {num_logprobs} candidates exceeds "
+            f"{_MAX_MERGE_CANDIDATES}: the merge kernel keeps every candidate of "
+            "a row in one program"
         )
 
 

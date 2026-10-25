@@ -141,6 +141,28 @@ def test_compute_topk_logprobs_ties(dtype):
     _check(out, logits, num_logprobs, sampled)
 
 
+def test_compute_topk_logprobs_sampled_neg_inf_rank():
+    # 4099 is not a multiple of any tuned BLOCK_SIZE, so the masked tail of
+    # _ranks_kernel always runs.
+    batch, vocab, num_logprobs = 3, 4099, 5
+    logits = _make_logits(batch, vocab, torch.float32, seed=9)
+    sampled = torch.randint(vocab, (batch,), device=device, dtype=torch.int32)
+    logits[0, sampled[0]] = float("-inf")
+
+    out = flaggems_vllm.compute_topk_logprobs(logits, num_logprobs, sampled)
+    expected = torch.log_softmax(logits.to(torch.float32), dim=-1)
+    expected_ranks = (logits >= logits.gather(1, sampled.to(torch.int64)[:, None])).sum(
+        1
+    )
+    assert torch.equal(out.selected_token_ranks, expected_ranks)
+    torch.testing.assert_close(
+        out.logprobs,
+        expected.gather(1, out.logprob_token_ids),
+        atol=1e-4,
+        rtol=1e-4,
+    )
+
+
 def test_compute_topk_logprobs_matches_vllm():
     logprob = pytest.importorskip("vllm.v1.worker.gpu.sample.logprob")
     reference_fn = getattr(logprob, "compute_topk_logprobs", None)
