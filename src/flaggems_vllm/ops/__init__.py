@@ -22,6 +22,7 @@ from flaggems_vllm.ops.bf16_paged_mqa_logits import bf16_paged_mqa_logits
 from flaggems_vllm.ops.bincount import bincount
 from flaggems_vllm.ops.chunk_gated_delta_rule import chunk_gated_delta_rule
 from flaggems_vllm.ops.concat_and_cache_mla import concat_and_cache_mla
+from flaggems_vllm.ops.compute_topk_logprobs import compute_topk_logprobs
 from flaggems_vllm.ops.concat_mla_q import concat_mla_q
 from flaggems_vllm.ops.cp_gather_indexer_k_quant_cache import (
     cp_gather_indexer_k_quant_cache,
@@ -237,6 +238,7 @@ __all__ = [
     "chunk_kda_with_safe_gate",
     "combine_topk_swa_indices",
     "compute_global_topk_indices_and_lens",
+    "compute_topk_logprobs",
     "concat_and_cache_mla",
     "concat_mla_q",
     "concat_query",
