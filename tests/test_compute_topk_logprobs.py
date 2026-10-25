@@ -43,6 +43,7 @@ else:
     SHAPES = [
         (0, 128, 5),
         (1, 999, 3),
+        (2, 4096, 0),
         (3, 151936, 1),
         (8, 32768, 10),
         (64, 65536, 20),
@@ -68,6 +69,11 @@ def _make_logits(batch, vocab, dtype, seed=0, stride1=1):
     return base[:, ::stride1]
 
 
+def _selected_values(logits, ids):
+    """The selected logits, sorted, so equal-valued ids compare as a multiset."""
+    return torch.sort(logits.to(torch.float32).gather(1, ids), dim=1).values
+
+
 def _check(out, logits, num_logprobs, sampled):
     expected_ids, _, ranks = _reference(logits, num_logprobs, sampled)
 
@@ -81,10 +87,16 @@ def _check(out, logits, num_logprobs, sampled):
     assert torch.equal(
         out.logprob_token_ids[:, 0], sampled.to(torch.int64)
     ), "column 0 must be the sampled token"
+    # torch.topk may order equal-valued ids differently, so compare the
+    # selected values; the column order itself is checked right below.
     assert torch.equal(
-        torch.sort(out.logprob_token_ids, dim=1).values,
-        torch.sort(expected_ids, dim=1).values,
+        _selected_values(logits, out.logprob_token_ids),
+        _selected_values(logits, expected_ids),
     ), "top-k selection differs from the reference"
+    if num_logprobs > 1:
+        assert (
+            out.logprobs[:, 1:].diff(dim=1) <= 0
+        ).all(), "top-k columns must be ordered by descending logprob"
     assert torch.equal(out.selected_token_ranks, ranks)
 
     if logits.shape[0] == 0:
@@ -142,14 +154,21 @@ def test_compute_topk_logprobs_matches_vllm():
 
     expected = reference_fn(logits, num_logprobs, sampled)
     out = flaggems_vllm.compute_topk_logprobs(logits, num_logprobs, sampled)
+    if not hasattr(expected, "logprob_token_ids"):
+        pytest.skip("installed vLLM returns a different logprobs container")
 
     assert torch.equal(out.logprob_token_ids[:, 0], expected.logprob_token_ids[:, 0])
     assert torch.equal(
-        torch.sort(out.logprob_token_ids, dim=1).values,
-        torch.sort(expected.logprob_token_ids, dim=1).values,
+        _selected_values(logits, out.logprob_token_ids),
+        _selected_values(logits, expected.logprob_token_ids),
     )
+    # Compare vLLM's logprobs at the ids this kernel returned: ties let the two
+    # implementations order equal-valued ids differently.
+    expected_at_ours = torch.log_softmax(logits.to(torch.float32), dim=-1).gather(
+        1, out.logprob_token_ids
+    )
+    torch.testing.assert_close(out.logprobs, expected_at_ours, atol=1e-4, rtol=1e-4)
     assert torch.equal(out.selected_token_ranks, expected.selected_token_ranks)
-    torch.testing.assert_close(out.logprobs, expected.logprobs, atol=1e-4, rtol=1e-4)
 
 
 def test_compute_topk_logprobs_metadata_passthrough():
@@ -177,3 +196,7 @@ def test_compute_topk_logprobs_unsupported():
         flaggems_vllm.compute_topk_logprobs(logits[0], 3, sampled)
     with pytest.raises(ValueError):
         flaggems_vllm.compute_topk_logprobs(logits, 3, sampled.to(torch.float32))
+    with pytest.raises(ValueError):
+        flaggems_vllm.compute_topk_logprobs(logits, 3, sampled[:1])
+    with pytest.raises(NotImplementedError):
+        flaggems_vllm.compute_topk_logprobs(logits, 257, sampled)

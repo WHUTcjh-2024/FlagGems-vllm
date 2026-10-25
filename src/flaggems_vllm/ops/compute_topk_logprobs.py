@@ -31,7 +31,8 @@ full-block/tail split, pipelined sweep) with 0.20.2's two-kernel shape.
 Semantics match vLLM 0.20.2 for fp16/bf16/fp32 row-major logits; ``+inf``
 logits select normally, NaN logits are unsupported (``tl.max`` has no NaN
 ordering, same as the reference kernels). Ties are broken by the lowest vocab
-index, which is a valid ``torch.topk`` ordering.
+index, which is a valid ``torch.topk`` ordering. ``num_logprobs`` is supported
+up to ``_MAX_NUM_LOGPROBS``.
 """
 
 from __future__ import annotations
@@ -49,37 +50,27 @@ from flaggems_vllm.utils import libentry, libtuner
 # derived from this value, so it is fixed on the host instead of being a
 # tunable knob; only num_warps/num_stages come from tune_configs.yaml.
 _BLOCK_TOPK_TILE = 2048
-# Candidate tiles are rounded up to a power of two for the merge kernel.
+# Candidate tiles are rounded up to a power of two for the merge kernel, which
+# holds every candidate of a row in one program; keep that tile bounded.
 _MIN_MERGE_BLOCK = 128
+_MAX_NUM_LOGPROBS = 256
 
 
 class LogprobsTensors(NamedTuple):
-    """vLLM-compatible fallback when the real vllm package is absent."""
+    """Plain container used when vLLM is not installed at all."""
 
     logprob_token_ids: torch.Tensor
     logprobs: torch.Tensor
     selected_token_ranks: torch.Tensor
     cu_num_generated_tokens: list[int] | None = None
 
-    def tolists(self, cu_num_generated_tokens=None):
-        from vllm.v1.outputs import LogprobsLists
-
-        return LogprobsLists(
-            self.logprob_token_ids.cpu().numpy(),
-            self.logprobs.cpu().numpy(),
-            self.selected_token_ranks.cpu().numpy(),
-            (
-                cu_num_generated_tokens
-                if cu_num_generated_tokens is not None
-                else self.cu_num_generated_tokens
-            ),
-        )
-
 
 def _make_logprobs_tensors(logprob_token_ids, logprobs, token_ranks, cu_num_logits):
     try:
         from vllm.v1.outputs import LogprobsTensors as VllmLogprobsTensors
-    except ImportError:
+    except ModuleNotFoundError:
+        # Only a missing vllm package falls back; a broken vllm install must
+        # surface its own import error instead of silently changing the type.
         VllmLogprobsTensors = LogprobsTensors
     return VllmLogprobsTensors(
         logprob_token_ids=logprob_token_ids,
@@ -292,11 +283,20 @@ def _validate(logits, num_logprobs, sampled_token_ids):
         raise ValueError("sampled_token_ids must be int32 or int64")
     if sampled_token_ids.dim() != 1 or not sampled_token_ids.is_contiguous():
         raise ValueError("sampled_token_ids must be a contiguous 1-D tensor")
+    if sampled_token_ids.numel() != logits.shape[0]:
+        raise ValueError("sampled_token_ids must have one entry per logits row")
+    if logits.shape[1] == 0:
+        raise ValueError("compute_topk_logprobs requires a non-empty vocabulary")
     if num_logprobs < 0:
         raise ValueError("num_logprobs must be non-negative")
     if num_logprobs > logits.shape[1]:
         raise ValueError(
             f"num_logprobs ({num_logprobs}) exceeds vocab size ({logits.shape[1]})"
+        )
+    if num_logprobs > _MAX_NUM_LOGPROBS:
+        raise NotImplementedError(
+            f"num_logprobs above {_MAX_NUM_LOGPROBS} is not supported: the merge "
+            "kernel holds every candidate of a row in one program"
         )
 
 

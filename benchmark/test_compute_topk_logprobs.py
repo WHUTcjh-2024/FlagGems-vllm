@@ -29,7 +29,7 @@ try:
     from vllm.v1.worker.gpu.sample.logprob import (
         compute_topk_logprobs as _vllm_compute_topk_logprobs,
     )
-except ImportError:  # vLLM absent, or 0.29+ which renamed the entry point
+except Exception:  # noqa: BLE001 - vLLM absent/broken, or 0.29+ renamed it
     _vllm_compute_topk_logprobs = None
 
 
