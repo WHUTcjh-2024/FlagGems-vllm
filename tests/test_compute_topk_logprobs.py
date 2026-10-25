@@ -43,6 +43,8 @@ else:
     SHAPES = [
         (0, 128, 5),
         (1, 999, 3),
+        (2, 1, 0),
+        (2, 1, 1),
         (2, 4096, 0),
         (3, 151936, 1),
         (16, 8192, 2),
@@ -162,6 +164,26 @@ def test_compute_topk_logprobs_sampled_neg_inf_rank():
         atol=1e-4,
         rtol=1e-4,
     )
+
+
+def test_compute_topk_logprobs_nan_boundary():
+    # NaN logits are unsupported for selection (tl.max has no NaN ordering).
+    # This pins the boundary instead of a value: the call must not crash, the
+    # ids must stay in range and distinct, and the rank still matches because
+    # it only uses `>=` (NaN compares false, like the torch reference).
+    batch, vocab, num_logprobs = 3, 4099, 5
+    logits = _make_logits(batch, vocab, torch.float32, seed=13)
+    sampled = torch.randint(vocab, (batch,), device=device, dtype=torch.int32)
+    logits[1, 7] = float("nan")
+
+    out = flaggems_vllm.compute_topk_logprobs(logits, num_logprobs, sampled)
+    ids = out.logprob_token_ids
+    assert ids.shape == (batch, num_logprobs + 1)
+    assert ((ids >= 0) & (ids < vocab)).all()
+    ordered = ids.sort(dim=1).values
+    assert (ordered[:, 1:] != ordered[:, :-1]).all(), "ids must stay distinct"
+    ranks = (logits >= logits.gather(1, sampled.to(torch.int64)[:, None])).sum(1)
+    assert torch.equal(out.selected_token_ranks, ranks)
 
 
 def test_compute_topk_logprobs_matches_vllm():
