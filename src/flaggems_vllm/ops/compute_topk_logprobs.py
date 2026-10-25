@@ -20,6 +20,8 @@ vLLM builds ``[sampled_token_id] + topk(logits)`` with ``torch.topk`` and
 must not use torch compute/copy ops, so the top-k selection, the token-id
 packing and the rank count are all implemented as kernels:
 
+    _tile_max_kernel          max logit per (row, vocab block)
+    _threshold_kernel         per-row k-th largest tile max (pruning bound)
     _block_topk_kernel        top-k candidates per (row, vocab block)
     _merge_topk_kernel        per-row candidate merge + token-id packing
     _topk_log_softmax_kernel  online logsumexp + gather at the packed ids
@@ -83,6 +85,66 @@ def _make_logprobs_tensors(logprob_token_ids, logprobs, token_ranks, cu_num_logi
 
 @libentry()
 @libtuner(
+    configs=runtime.get_tuned_config("compute_topk_logprobs_tile_max"),
+    key=["vocab_size"],
+    strategy=["log"],
+)
+@triton.jit
+def _tile_max_kernel(
+    tile_max_ptr,
+    logits_ptr,
+    logits_stride0,
+    logits_stride1,
+    vocab_size,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    blk = tl.program_id(1)
+    offs = blk * BLOCK + tl.arange(0, BLOCK)
+    vals = tl.load(
+        logits_ptr + row * logits_stride0 + offs * logits_stride1,
+        mask=offs < vocab_size,
+        other=float("-inf"),
+    ).to(tl.float32)
+    num_blocks = tl.cdiv(vocab_size, BLOCK)
+    tl.store(tile_max_ptr + row * num_blocks + blk, tl.max(vals))
+
+
+@libentry()
+@libtuner(
+    configs=runtime.get_tuned_config("compute_topk_logprobs_threshold"),
+    key=["num_blocks", "topk"],
+    strategy=["log", "log"],
+)
+@triton.jit
+def _threshold_kernel(
+    tile_max_ptr,
+    threshold_ptr,
+    num_blocks,
+    topk,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    lane = tl.arange(0, BLOCK)
+    alive = lane < num_blocks
+    vals = tl.load(
+        tile_max_ptr + row * num_blocks + lane, mask=alive, other=float("-inf")
+    )
+
+    # The k-th largest tile max bounds the k-th largest logit from below: at
+    # least k tiles reach it, hence at least k logits do, so no logit below it
+    # can belong to the top-k. Fewer than k tiles leaves -inf, i.e. no pruning.
+    threshold = float("-inf")
+    for _ in tl.range(0, topk):
+        best = tl.max(tl.where(alive, vals, float("-inf")))
+        idx = tl.min(tl.where(alive & (vals == best), lane, num_blocks))
+        threshold = best
+        alive = alive & (lane != idx)
+    tl.store(threshold_ptr + row, threshold)
+
+
+@libentry()
+@libtuner(
     configs=runtime.get_tuned_config("compute_topk_logprobs_block_topk"),
     key=["vocab_size", "topk"],
     strategy=["log", "log"],
@@ -91,42 +153,59 @@ def _make_logprobs_tensors(logprob_token_ids, logprobs, token_ranks, cu_num_logi
 def _block_topk_kernel(
     cand_val_ptr,
     cand_idx_ptr,
+    tile_max_ptr,
+    threshold_ptr,
     logits_ptr,
     logits_stride0,
     logits_stride1,
     vocab_size,
     topk,
     BLOCK: tl.constexpr,
+    PRUNE: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     blk = tl.program_id(1)
-    offs = blk * BLOCK + tl.arange(0, BLOCK)
-    alive = offs < vocab_size
-    vals = tl.load(
-        logits_ptr + row * logits_stride0 + offs * logits_stride1,
-        mask=alive,
-        other=float("-inf"),
-    ).to(tl.float32)
-
     num_blocks = tl.cdiv(vocab_size, BLOCK)
     out = (row * num_blocks + blk) * topk
 
-    # A tile can only yield BLOCK distinct candidates; the remaining slots are
-    # filled with sentinels so the merge stage never sees uninitialized data.
-    n_iter = tl.minimum(topk, BLOCK)
-    for j in tl.range(0, n_iter):
-        best = tl.max(vals)
-        # Lowest index among the lanes holding `best`; dead lanes carry the
-        # sentinel index so an exhausted block emits nothing selectable.
-        cand = tl.where(alive, offs, vocab_size)
-        idx = tl.min(tl.where(vals == best, cand, vocab_size))
-        tl.store(cand_val_ptr + out + j, best)
-        tl.store(cand_idx_ptr + out + j, idx)
-        alive = alive & (offs != idx)
-        vals = tl.where(alive, vals, float("-inf"))
-    for j in tl.range(n_iter, topk):
-        tl.store(cand_val_ptr + out + j, float("-inf"))
-        tl.store(cand_idx_ptr + out + j, vocab_size)
+    if PRUNE:
+        tile_max = tl.load(tile_max_ptr + row * num_blocks + blk)
+        threshold = tl.load(threshold_ptr + row)
+        pruned = tile_max < threshold
+    else:
+        pruned = False
+
+    if pruned:
+        # A tile below the row threshold cannot hold a top-k logit, but the
+        # merge stage still needs sentinels instead of uninitialized slots.
+        for j in tl.range(0, topk):
+            tl.store(cand_val_ptr + out + j, float("-inf"))
+            tl.store(cand_idx_ptr + out + j, vocab_size)
+    else:
+        offs = blk * BLOCK + tl.arange(0, BLOCK)
+        alive = offs < vocab_size
+        vals = tl.load(
+            logits_ptr + row * logits_stride0 + offs * logits_stride1,
+            mask=alive,
+            other=float("-inf"),
+        ).to(tl.float32)
+
+        # A tile can only yield BLOCK distinct candidates; the remaining slots
+        # are filled with sentinels so merge never sees uninitialized data.
+        n_iter = tl.minimum(topk, BLOCK)
+        for j in tl.range(0, n_iter):
+            best = tl.max(vals)
+            # Lowest index among the lanes holding `best`; dead lanes carry the
+            # sentinel index so an exhausted block emits nothing selectable.
+            cand = tl.where(alive, offs, vocab_size)
+            idx = tl.min(tl.where(vals == best, cand, vocab_size))
+            tl.store(cand_val_ptr + out + j, best)
+            tl.store(cand_idx_ptr + out + j, idx)
+            alive = alive & (offs != idx)
+            vals = tl.where(alive, vals, float("-inf"))
+        for j in tl.range(n_iter, topk):
+            tl.store(cand_val_ptr + out + j, float("-inf"))
+            tl.store(cand_idx_ptr + out + j, vocab_size)
 
 
 @libentry()
@@ -356,16 +435,44 @@ def compute_topk_logprobs(
     )
 
     with torch.cuda.device(device):
+        # Pruning pays for its two extra launches only when clearly fewer than
+        # half the tiles can still contribute; below that every tile can.
+        prune = num_logprobs > 0 and num_blocks >= 2 * num_logprobs
+        tile_max = cand_val  # never read unless PRUNE is on
+        threshold = cand_val
+        if prune:
+            tile_max = torch.empty(
+                (batch_size * num_blocks,), dtype=torch.float32, device=device
+            )
+            threshold = torch.empty((batch_size,), dtype=torch.float32, device=device)
+            _tile_max_kernel[(batch_size, num_blocks)](
+                tile_max,
+                logits,
+                logits.stride(0),
+                logits.stride(1),
+                vocab_size,
+                BLOCK=_BLOCK_TOPK_TILE,
+            )
+            _threshold_kernel[(batch_size,)](
+                tile_max,
+                threshold,
+                num_blocks,
+                num_logprobs,
+                BLOCK=triton.next_power_of_2(num_blocks),
+            )
         if num_logprobs > 0:
             _block_topk_kernel[(batch_size, num_blocks)](
                 cand_val,
                 cand_idx,
+                tile_max,
+                threshold,
                 logits,
                 logits.stride(0),
                 logits.stride(1),
                 vocab_size,
                 num_logprobs,
                 BLOCK=_BLOCK_TOPK_TILE,
+                PRUNE=prune,
             )
         merge_block = max(
             triton.next_power_of_2(max(num_candidates, 1)), _MIN_MERGE_BLOCK

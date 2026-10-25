@@ -1135,6 +1135,22 @@ concat_mla_q:
 
 # `BLOCK` is fixed on the host for the two top-k stages because the candidate
 # workspace layout derives from it; only launch geometry is tuned here.
+compute_topk_logprobs_tile_max:
+  - META: {}
+    num_warps: 4
+    num_stages: 1
+  - META: {}
+    num_warps: 8
+    num_stages: 1
+
+compute_topk_logprobs_threshold:
+  - META: {}
+    num_warps: 1
+    num_stages: 1
+  - META: {}
+    num_warps: 4
+    num_stages: 1
+
 compute_topk_logprobs_block_topk:
   - META: {}
     num_warps: 4
