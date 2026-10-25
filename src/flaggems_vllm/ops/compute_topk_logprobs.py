@@ -35,6 +35,17 @@ logits select normally, NaN logits are unsupported (``tl.max`` has no NaN
 ordering, same as the reference kernels). Ties are broken by the lowest vocab
 index, which is a valid ``torch.topk`` ordering. ``num_logprobs`` is supported
 up to ``_MAX_NUM_LOGPROBS``.
+
+Deviation: ``logprob_token_ids`` is always int64. The reference returns
+``sampled_token_ids``' own dtype when ``num_logprobs == 0`` (int32 on vLLM's
+sampler path) and only widens through ``torch.cat`` for ``num_logprobs > 0``;
+every consumer casts the ids before use, so this is observable through
+``.dtype`` only.
+
+``persistent_topk`` and ``top_k_per_row_prefill`` are not reused: both accept
+float32 logits only, ``persistent_topk`` requires k in {512, 1024, 2048} plus a
+length vector and an external workspace, and both return int32 indices with no
+logprob pass, so neither covers k <= 256 over fp16/bf16 logits.
 """
 
 from __future__ import annotations

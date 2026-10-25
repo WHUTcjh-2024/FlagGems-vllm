@@ -14,8 +14,9 @@
 
 """Performance benchmark for ``flaggems_vllm.compute_topk_logprobs``.
 
-Baseline is vLLM 0.20.2's own ``compute_topk_logprobs`` when it is importable,
-otherwise an equivalent torch reference (``torch.topk`` + ``log_softmax``).
+The baseline is vLLM 0.20.2's own ``compute_topk_logprobs``. When it is not
+importable the benchmark skips instead of silently timing against a different
+reference, so a reported SpeedUp always means "vs vLLM".
 """
 
 import pytest
@@ -31,17 +32,6 @@ try:
     )
 except Exception:  # noqa: BLE001 - vLLM absent/broken, or 0.29+ renamed it
     _vllm_compute_topk_logprobs = None
-
-
-def reference(logits, num_logprobs, sampled):
-    token_ids = sampled.unsqueeze(-1).to(torch.int64)
-    if num_logprobs > 0:
-        token_ids = torch.cat(
-            (token_ids, torch.topk(logits, num_logprobs, dim=-1).indices), dim=1
-        )
-    logprobs = torch.log_softmax(logits.to(torch.float32), dim=-1).gather(1, token_ids)
-    ranks = (logits >= logits.gather(1, sampled.to(torch.int64)[:, None])).sum(1)
-    return token_ids, logprobs, ranks
 
 
 class OperatorBenchmark(base.Benchmark):
@@ -70,10 +60,14 @@ class OperatorBenchmark(base.Benchmark):
 
 @pytest.mark.compute_topk_logprobs
 def test_perf_compute_topk_logprobs():
-    torch_op = _vllm_compute_topk_logprobs or reference
+    if _vllm_compute_topk_logprobs is None:
+        pytest.skip(
+            "vLLM's compute_topk_logprobs is unavailable; refusing to report a "
+            "SpeedUp against a different baseline"
+        )
     bench = OperatorBenchmark(
         op_name="compute_topk_logprobs",
-        torch_op=torch_op,
+        torch_op=_vllm_compute_topk_logprobs,
         gems_op=flaggems_vllm.compute_topk_logprobs,
         dtypes=[torch.bfloat16, torch.float16, torch.float32],
     )
