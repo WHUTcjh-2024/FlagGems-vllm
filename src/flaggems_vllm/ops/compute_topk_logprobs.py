@@ -36,11 +36,9 @@ ordering, same as the reference kernels). Ties are broken by the lowest vocab
 index, which is a valid ``torch.topk`` ordering. ``num_logprobs`` is supported
 up to ``_MAX_NUM_LOGPROBS``.
 
-Deviation: ``logprob_token_ids`` is always int64. The reference returns
-``sampled_token_ids``' own dtype when ``num_logprobs == 0`` (int32 on vLLM's
-sampler path) and only widens through ``torch.cat`` for ``num_logprobs > 0``;
-every consumer casts the ids before use, so this is observable through
-``.dtype`` only.
+``logprob_token_ids`` follows vLLM's dtype exactly: it keeps
+``sampled_token_ids``' dtype when ``num_logprobs == 0`` and is int64 otherwise,
+matching the reference's ``unsqueeze``/``torch.cat`` promotion.
 
 ``persistent_topk`` and ``top_k_per_row_prefill`` are not reused: both accept
 float32 logits only, ``persistent_topk`` requires k in {512, 1024, 2048} plus a
@@ -236,6 +234,7 @@ def _merge_topk_kernel(
     num_candidates,
     vocab_size,
     topk,
+    ID_INT64: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
@@ -250,11 +249,18 @@ def _merge_topk_kernel(
     alive = live & (idxs < vocab_size)
 
     out = row * (topk + 1)
-    tl.store(token_ids_ptr + out, tl.load(sampled_ptr + row).to(tl.int64))
+    sampled = tl.load(sampled_ptr + row)
+    if ID_INT64:
+        tl.store(token_ids_ptr + out, sampled.to(tl.int64))
+    else:
+        tl.store(token_ids_ptr + out, sampled.to(tl.int32))
     for j in tl.range(0, topk):
         best = tl.max(tl.where(alive, vals, float("-inf")))
         idx = tl.min(tl.where(alive & (vals == best), idxs, vocab_size))
-        tl.store(token_ids_ptr + out + 1 + j, idx.to(tl.int64))
+        if ID_INT64:
+            tl.store(token_ids_ptr + out + 1 + j, idx.to(tl.int64))
+        else:
+            tl.store(token_ids_ptr + out + 1 + j, idx.to(tl.int32))
         alive = alive & (idxs != idx)
 
 
@@ -312,9 +318,11 @@ def _topk_log_softmax_kernel(
         k_offset = j + tl.arange(0, TOPK_BLOCK_SIZE)
         k_mask = k_offset < topk
         ids = tl.load(topk_ids_ptr + req_idx * topk + k_offset, mask=k_mask, other=0)
-        logits = tl.load(row_ptr + ids * logits_stride1, mask=k_mask, other=0.0).to(
-            tl.float32
-        )
+        # ids may be int32 (k == 0 keeps the sampled dtype); widen before the
+        # stride multiply so the offset cannot wrap.
+        logits = tl.load(
+            row_ptr + ids.to(tl.int64) * logits_stride1, mask=k_mask, other=0.0
+        ).to(tl.float32)
         tl.store(
             output_ptr + req_idx * topk + k_offset,
             logits - max_val - lse,
@@ -424,8 +432,11 @@ def compute_topk_logprobs(
     num_cols = num_logprobs + 1
     device = logits.device
 
+    # vLLM keeps sampled_token_ids' dtype when nothing is concatenated and the
+    # topk indices widen it to int64 otherwise; match that exactly.
+    id_dtype = torch.int64 if num_logprobs > 0 else sampled_token_ids.dtype
     logprob_token_ids = torch.empty(
-        (batch_size, num_cols), dtype=torch.int64, device=device
+        (batch_size, num_cols), dtype=id_dtype, device=device
     )
     logprobs = torch.empty((batch_size, num_cols), dtype=torch.float32, device=device)
     token_ranks = torch.empty((batch_size,), dtype=torch.int64, device=device)
@@ -496,6 +507,7 @@ def compute_topk_logprobs(
             num_candidates,
             vocab_size,
             num_logprobs,
+            ID_INT64=id_dtype == torch.int64,
             BLOCK=merge_block,
         )
         _topk_log_softmax_kernel[(batch_size,)](

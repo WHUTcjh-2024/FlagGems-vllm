@@ -55,11 +55,15 @@ else:
 
 
 def _reference(logits, num_logprobs, sampled):
-    token_ids = sampled.unsqueeze(-1).to(torch.int64)
+    # Mirrors vLLM: unsqueeze keeps the sampled dtype, torch.cat with int64
+    # topk indices widens it to int64 only when something is concatenated.
+    token_ids = sampled.unsqueeze(-1)
     if num_logprobs > 0:
         topk_ids = torch.topk(logits, num_logprobs, dim=-1).indices
         token_ids = torch.cat((token_ids, topk_ids), dim=1)
-    logprobs = torch.log_softmax(logits.to(torch.float32), dim=-1).gather(1, token_ids)
+    logprobs = torch.log_softmax(logits.to(torch.float32), dim=-1).gather(
+        1, token_ids.to(torch.int64)
+    )
     ranks = (logits >= logits.gather(1, sampled.to(torch.int64)[:, None])).sum(1)
     return token_ids, logprobs, ranks
 
@@ -74,21 +78,23 @@ def _make_logits(batch, vocab, dtype, seed=0, stride1=1):
 
 def _selected_values(logits, ids):
     """The selected logits, sorted, so equal-valued ids compare as a multiset."""
-    return torch.sort(logits.to(torch.float32).gather(1, ids), dim=1).values
+    return torch.sort(
+        logits.to(torch.float32).gather(1, ids.to(torch.int64)), dim=1
+    ).values
 
 
 def _check(out, logits, num_logprobs, sampled):
     expected_ids, _, ranks = _reference(logits, num_logprobs, sampled)
 
     assert out.logprob_token_ids.shape == expected_ids.shape
-    assert out.logprob_token_ids.dtype == torch.int64
+    assert out.logprob_token_ids.dtype == expected_ids.dtype
     assert out.logprobs.shape == expected_ids.shape
     assert out.logprobs.dtype == torch.float32
     assert out.selected_token_ranks.shape == sampled.shape
     assert out.selected_token_ranks.dtype == torch.int64
 
     assert torch.equal(
-        out.logprob_token_ids[:, 0], sampled.to(torch.int64)
+        out.logprob_token_ids[:, 0], sampled.to(out.logprob_token_ids.dtype)
     ), "column 0 must be the sampled token"
     # torch.topk may order equal-valued ids differently, so compare the
     # selected values; the column order itself is checked right below.
@@ -105,7 +111,7 @@ def _check(out, logits, num_logprobs, sampled):
     if logits.shape[0] == 0:
         return
     expected_logprobs = torch.log_softmax(logits.to(torch.float32), dim=-1).gather(
-        1, out.logprob_token_ids
+        1, out.logprob_token_ids.to(torch.int64)
     )
     torch.testing.assert_close(out.logprobs, expected_logprobs, atol=1e-4, rtol=1e-4)
 
@@ -160,7 +166,7 @@ def test_compute_topk_logprobs_sampled_neg_inf_rank():
     assert torch.equal(out.selected_token_ranks, expected_ranks)
     torch.testing.assert_close(
         out.logprobs,
-        expected.gather(1, out.logprob_token_ids),
+        expected.gather(1, out.logprob_token_ids.to(torch.int64)),
         atol=1e-4,
         rtol=1e-4,
     )
@@ -197,23 +203,40 @@ def test_compute_topk_logprobs_matches_vllm():
     logits = torch.randn((batch, vocab), device=device, dtype=torch.bfloat16)
     sampled = torch.randint(vocab, (batch,), device=device, dtype=torch.int32)
 
-    expected = reference_fn(logits, num_logprobs, sampled)
-    out = flaggems_vllm.compute_topk_logprobs(logits, num_logprobs, sampled)
-    if not hasattr(expected, "logprob_token_ids"):
-        pytest.skip("installed vLLM returns a different logprobs container")
+    # k == 0 is the case where the reference keeps the sampled int32 dtype.
+    for k in (0, num_logprobs):
+        expected = reference_fn(logits, k, sampled)
+        out = flaggems_vllm.compute_topk_logprobs(logits, k, sampled)
+        if not hasattr(expected, "logprob_token_ids"):
+            pytest.skip("installed vLLM returns a different logprobs container")
 
-    assert torch.equal(out.logprob_token_ids[:, 0], expected.logprob_token_ids[:, 0])
-    assert torch.equal(
-        _selected_values(logits, out.logprob_token_ids),
-        _selected_values(logits, expected.logprob_token_ids),
-    )
-    # Compare vLLM's logprobs at the ids this kernel returned: ties let the two
-    # implementations order equal-valued ids differently.
-    expected_at_ours = torch.log_softmax(logits.to(torch.float32), dim=-1).gather(
-        1, out.logprob_token_ids
-    )
-    torch.testing.assert_close(out.logprobs, expected_at_ours, atol=1e-4, rtol=1e-4)
-    assert torch.equal(out.selected_token_ranks, expected.selected_token_ranks)
+        assert out.logprob_token_ids.dtype == expected.logprob_token_ids.dtype
+        assert torch.equal(
+            out.logprob_token_ids[:, 0], expected.logprob_token_ids[:, 0]
+        )
+        assert torch.equal(
+            _selected_values(logits, out.logprob_token_ids),
+            _selected_values(logits, expected.logprob_token_ids),
+        )
+        # Compare vLLM's logprobs at the ids this kernel returned: ties let the
+        # two implementations order equal-valued ids differently.
+        expected_at_ours = torch.log_softmax(logits.to(torch.float32), dim=-1).gather(
+            1, out.logprob_token_ids.to(torch.int64)
+        )
+        torch.testing.assert_close(out.logprobs, expected_at_ours, atol=1e-4, rtol=1e-4)
+        assert torch.equal(out.selected_token_ranks, expected.selected_token_ranks)
+
+
+def test_compute_topk_logprobs_token_id_dtype():
+    # vLLM keeps the sampled dtype when k == 0 (unsqueeze only) and promotes to
+    # int64 once the top-k indices are concatenated.
+    logits = _make_logits(2, 1024, torch.float32, seed=3)
+    for sampled_dtype in (torch.int32, torch.int64):
+        sampled = torch.randint(1024, (2,), device=device, dtype=sampled_dtype)
+        no_topk = flaggems_vllm.compute_topk_logprobs(logits, 0, sampled)
+        assert no_topk.logprob_token_ids.dtype == sampled_dtype
+        with_topk = flaggems_vllm.compute_topk_logprobs(logits, 3, sampled)
+        assert with_topk.logprob_token_ids.dtype == torch.int64
 
 
 def test_compute_topk_logprobs_metadata_passthrough():
