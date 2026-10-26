@@ -30,11 +30,11 @@ packing and the rank count are all implemented as kernels:
 The last two keep the kernel bodies of vLLM 0.29.0 (fused online logsumexp,
 full-block/tail split, pipelined sweep) with 0.20.2's two-kernel shape.
 
-Semantics match vLLM 0.20.2 for fp16/bf16/fp32 row-major logits; ``+inf``
-logits select normally, NaN logits are unsupported (``tl.max`` has no NaN
-ordering, same as the reference kernels). Ties are broken by the lowest vocab
-index, which is a valid ``torch.topk`` ordering. ``num_logprobs`` is supported
-up to ``_MAX_NUM_LOGPROBS``.
+Semantics match vLLM 0.20.2 for fp16/bf16/fp32 CUDA logits with non-negative
+strides; ``+inf`` logits select normally, NaN logits are unsupported (``tl.max``
+has no NaN ordering, same as the reference kernels). Ties are broken by the
+lowest vocab index, which is a valid ``torch.topk`` ordering. ``num_logprobs``
+is supported up to ``_MAX_NUM_LOGPROBS``.
 
 ``logprob_token_ids`` follows vLLM's dtype exactly: it keeps
 ``sampled_token_ids``' dtype when ``num_logprobs == 0`` and is int64 otherwise,
