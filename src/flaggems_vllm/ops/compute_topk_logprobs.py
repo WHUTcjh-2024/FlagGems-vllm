@@ -31,10 +31,11 @@ The last two keep the kernel bodies of vLLM 0.29.0 (fused online logsumexp,
 full-block/tail split, pipelined sweep) with 0.20.2's two-kernel shape.
 
 Semantics match vLLM 0.20.2 for fp16/bf16/fp32 CUDA logits with non-negative
-strides; ``+inf`` logits select normally, NaN logits are unsupported (``tl.max``
-has no NaN ordering, same as the reference kernels). Ties are broken by the
-lowest vocab index, which is a valid ``torch.topk`` ordering. ``num_logprobs``
-is supported up to ``_MAX_NUM_LOGPROBS``.
+strides; ``+inf`` logits select normally. Selection treats NaN logits as
+``-inf`` so every emitted token id stays in range; log-softmax still propagates
+NaN, and numerical parity with vLLM is not promised for NaN inputs. Ties are
+broken by the lowest vocab index, which is a valid ``torch.topk`` ordering.
+``num_logprobs`` is supported up to ``_MAX_NUM_LOGPROBS``.
 
 ``logprob_token_ids`` follows vLLM's dtype exactly: it keeps
 ``sampled_token_ids``' dtype when ``num_logprobs == 0`` and is int64 otherwise,
@@ -111,10 +112,11 @@ def _tile_max_kernel(
     blk = tl.program_id(1)
     offs = blk * BLOCK + tl.arange(0, BLOCK)
     vals = tl.load(
-        logits_ptr + row * logits_stride0 + offs * logits_stride1,
+        logits_ptr + row * logits_stride0 + offs.to(tl.int64) * logits_stride1,
         mask=offs < vocab_size,
         other=float("-inf"),
     ).to(tl.float32)
+    vals = tl.where(tl.isnan(vals), float("-inf"), vals)
     num_blocks = tl.cdiv(vocab_size, BLOCK)
     tl.store(tile_max_ptr + row * num_blocks + blk, tl.max(vals))
 
@@ -194,10 +196,14 @@ def _block_topk_kernel(
         offs = blk * BLOCK + tl.arange(0, BLOCK)
         alive = offs < vocab_size
         vals = tl.load(
-            logits_ptr + row * logits_stride0 + offs * logits_stride1,
+            logits_ptr + row * logits_stride0 + offs.to(tl.int64) * logits_stride1,
             mask=alive,
             other=float("-inf"),
         ).to(tl.float32)
+
+        # Keep NaNs out of the max reduction: NaN == NaN is false, which would
+        # otherwise emit the out-of-range sentinel as a token id.
+        vals = tl.where(tl.isnan(vals), float("-inf"), vals)
 
         # A tile can only yield BLOCK distinct candidates; the remaining slots
         # are filled with sentinels so merge never sees uninitialized data.
@@ -290,7 +296,7 @@ def _topk_log_softmax_kernel(
     se = 0.0
     for i in tl.range(0, full, BLOCK_SIZE, num_stages=2, loop_unroll_factor=2):
         block = i + tl.arange(0, BLOCK_SIZE)
-        logits = tl.load(row_ptr + block * logits_stride1).to(tl.float32)
+        logits = tl.load(row_ptr + block.to(tl.int64) * logits_stride1).to(tl.float32)
         block_max = tl.max(logits)
         new_max = tl.maximum(max_val, block_max)
         # Keep the accumulator at zero until a finite logit appears. An
@@ -302,7 +308,7 @@ def _topk_log_softmax_kernel(
     if full < vocab_size:
         block = full + tl.arange(0, BLOCK_SIZE)
         logits = tl.load(
-            row_ptr + block * logits_stride1,
+            row_ptr + block.to(tl.int64) * logits_stride1,
             mask=block < vocab_size,
             other=float("-inf"),
         ).to(tl.float32)
@@ -350,20 +356,20 @@ def _ranks_kernel(
     row_ptr = logits_ptr + req_idx * logits_stride0
 
     token_id = tl.load(token_ids_ptr + req_idx)
-    x = tl.load(row_ptr + token_id * logits_stride1)
+    x = tl.load(row_ptr + token_id.to(tl.int64) * logits_stride1)
 
     full = (vocab_size // BLOCK_SIZE) * BLOCK_SIZE
     n = 0
     for i in tl.range(0, full, BLOCK_SIZE, num_stages=4):
         block = i + tl.arange(0, BLOCK_SIZE)
-        logits = tl.load(row_ptr + block * logits_stride1)
+        logits = tl.load(row_ptr + block.to(tl.int64) * logits_stride1)
         n += tl.sum((logits >= x).to(tl.int32))
 
     if full < vocab_size:
         block = full + tl.arange(0, BLOCK_SIZE)
         in_range = block < vocab_size
         logits = tl.load(
-            row_ptr + block * logits_stride1,
+            row_ptr + block.to(tl.int64) * logits_stride1,
             mask=in_range,
             other=float("-inf"),
         )

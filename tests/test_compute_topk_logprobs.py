@@ -173,23 +173,34 @@ def test_compute_topk_logprobs_sampled_neg_inf_rank():
 
 
 def test_compute_topk_logprobs_nan_boundary():
-    # NaN logits are unsupported for selection (tl.max has no NaN ordering).
-    # This pins the boundary instead of a value: the call must not crash, the
-    # ids must stay in range and distinct, and the rank still matches because
-    # it only uses `>=` (NaN compares false, like the torch reference).
+    # NaN selection has a deterministic safety rule, while log-softmax follows
+    # the reference and propagates NaN.
     batch, vocab, num_logprobs = 3, 4099, 5
     logits = _make_logits(batch, vocab, torch.float32, seed=13)
-    sampled = torch.randint(vocab, (batch,), device=device, dtype=torch.int32)
+    sampled = torch.full((batch,), vocab - 1, device=device, dtype=torch.int32)
     logits[1, 7] = float("nan")
 
     out = flaggems_vllm.compute_topk_logprobs(logits, num_logprobs, sampled)
     ids = out.logprob_token_ids
     assert ids.shape == (batch, num_logprobs + 1)
     assert ((ids >= 0) & (ids < vocab)).all()
-    ordered = ids.sort(dim=1).values
+    ordered = ids[:, 1:].sort(dim=1).values
     assert (ordered[:, 1:] != ordered[:, :-1]).all(), "ids must stay distinct"
     ranks = (logits >= logits.gather(1, sampled.to(torch.int64)[:, None])).sum(1)
     assert torch.equal(out.selected_token_ranks, ranks)
+
+
+@pytest.mark.parametrize("vocab", [1024, 65536])
+def test_compute_topk_logprobs_all_nan_ids_stay_in_range(vocab):
+    # The larger shape also exercises tile-max threshold pruning.
+    logits = torch.full((1, vocab), float("nan"), device=device)
+    sampled = torch.tensor([vocab - 1], device=device, dtype=torch.int32)
+
+    out = flaggems_vllm.compute_topk_logprobs(logits, 1, sampled)
+
+    assert out.logprob_token_ids.tolist() == [[vocab - 1, 0]]
+    assert torch.isnan(out.logprobs).all()
+    assert out.selected_token_ranks.tolist() == [0]
 
 
 def test_compute_topk_logprobs_matches_vllm():
